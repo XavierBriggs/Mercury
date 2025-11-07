@@ -1,0 +1,446 @@
+package writer
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/XavierBriggs/Mercury/pkg/models"
+	"github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
+)
+
+const (
+	defaultBatchSize     = 100
+	defaultFlushInterval = 5 * time.Second
+	streamKeyFormat      = "odds.raw.%s" // odds.raw.basketball_nba
+)
+
+// Writer batches Alexandria DB writes and publishes to Redis Streams
+// Implements the write-through cache pattern
+type Writer struct {
+	db    *sql.DB
+	redis *redis.Client
+
+	batchSize     int
+	flushInterval time.Duration
+
+	buffer []models.RawOdds
+	mu     sync.Mutex
+
+	flushTicker *time.Ticker
+	stopChan    chan struct{}
+	wg          sync.WaitGroup
+}
+
+// StreamMessage represents a message published to Redis Stream
+type StreamMessage struct {
+	EventID          string    `json:"event_id"`
+	SportKey         string    `json:"sport_key"`
+	MarketKey        string    `json:"market_key"`
+	BookKey          string    `json:"book_key"`
+	OutcomeName      string    `json:"outcome_name"`
+	Price            int       `json:"price"`
+	Point            *float64  `json:"point,omitempty"`
+	VendorLastUpdate time.Time `json:"vendor_last_update"`
+	ReceivedAt       time.Time `json:"received_at"`
+	ChangeType       string    `json:"change_type,omitempty"`
+}
+
+// NewWriter creates a new batching writer
+func NewWriter(db *sql.DB, redisClient *redis.Client) *Writer {
+	return &Writer{
+		db:            db,
+		redis:         redisClient,
+		batchSize:     defaultBatchSize,
+		flushInterval: defaultFlushInterval,
+		buffer:        make([]models.RawOdds, 0, defaultBatchSize),
+		stopChan:      make(chan struct{}),
+	}
+}
+
+// Start begins the background flush ticker
+func (w *Writer) Start(ctx context.Context) {
+	w.flushTicker = time.NewTicker(w.flushInterval)
+
+	w.wg.Add(1)
+	go func() {
+		defer w.wg.Done()
+		for {
+			select {
+			case <-w.flushTicker.C:
+				if err := w.Flush(ctx); err != nil {
+					// Log error but continue (would use proper logging in production)
+					fmt.Printf("flush error: %v\n", err)
+				}
+			case <-w.stopChan:
+				w.flushTicker.Stop()
+				// Final flush on shutdown
+				_ = w.Flush(ctx)
+				return
+			case <-ctx.Done():
+				w.flushTicker.Stop()
+				return
+			}
+		}
+	}()
+}
+
+// Stop gracefully shuts down the writer
+func (w *Writer) Stop() {
+	close(w.stopChan)
+	w.wg.Wait()
+}
+
+// Write adds odds to the buffer and flushes if batch size is reached
+func (w *Writer) Write(ctx context.Context, odds []models.RawOdds) error {
+	w.mu.Lock()
+	w.buffer = append(w.buffer, odds...)
+	shouldFlush := len(w.buffer) >= w.batchSize
+	w.mu.Unlock()
+
+	if shouldFlush {
+		return w.Flush(ctx)
+	}
+
+	return nil
+}
+
+// WriteWithEvents writes events and odds together (for immediate upsert)
+func (w *Writer) WriteWithEvents(ctx context.Context, events []models.Event, odds []models.RawOdds) error {
+	if len(events) == 0 && len(odds) == 0 {
+		return nil
+	}
+
+	// Execute write in transaction immediately (bypass buffer)
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Step 0: Upsert events
+	if len(events) > 0 {
+		if err := w.upsertEventsFromList(ctx, tx, events); err != nil {
+			return fmt.Errorf("upsert events: %w", err)
+		}
+	}
+
+	// Step 0.5: Upsert books (extract from odds)
+	if len(odds) > 0 {
+		if err := w.upsertBooksFromOdds(ctx, tx, odds); err != nil {
+			return fmt.Errorf("upsert books: %w", err)
+		}
+	}
+
+	// Step 1: Update previous rows (set is_latest = false)
+	if len(odds) > 0 {
+		if err := w.updatePreviousOdds(ctx, tx, odds); err != nil {
+			return fmt.Errorf("update previous odds: %w", err)
+		}
+
+		// Step 2: Insert new rows (with is_latest = true)
+		if err := w.insertNewOdds(ctx, tx, odds); err != nil {
+			return fmt.Errorf("insert new odds: %w", err)
+		}
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+
+	// Step 3: Publish to Redis Streams (after successful DB write)
+	if len(odds) > 0 {
+		if err := w.publishToStream(ctx, odds); err != nil {
+			// Log but don't fail - DB is source of truth
+			fmt.Printf("publish to stream error: %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+// Flush writes buffered odds to Alexandria and publishes to Redis Stream
+func (w *Writer) Flush(ctx context.Context) error {
+	w.mu.Lock()
+	if len(w.buffer) == 0 {
+		w.mu.Unlock()
+		return nil
+	}
+
+	// Swap buffer
+	odds := w.buffer
+	w.buffer = make([]models.RawOdds, 0, w.batchSize)
+	w.mu.Unlock()
+
+	// Execute write in transaction
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Step 1: Update previous rows (set is_latest = false)
+	if err := w.updatePreviousOdds(ctx, tx, odds); err != nil {
+		return fmt.Errorf("update previous odds: %w", err)
+	}
+
+	// Step 2: Insert new rows (with is_latest = true)
+	if err := w.insertNewOdds(ctx, tx, odds); err != nil {
+		return fmt.Errorf("insert new odds: %w", err)
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+
+	// Step 3: Publish to Redis Streams (after successful DB write)
+	if err := w.publishToStream(ctx, odds); err != nil {
+		// Log but don't fail - DB is source of truth
+		fmt.Printf("publish to stream error: %v\n", err)
+	}
+
+	return nil
+}
+
+// updatePreviousOdds sets is_latest = false for existing odds
+func (w *Writer) updatePreviousOdds(ctx context.Context, tx *sql.Tx, odds []models.RawOdds) error {
+	if len(odds) == 0 {
+		return nil
+	}
+
+	// Build UPDATE statement for batch
+	// UPDATE odds_raw SET is_latest = false 
+	// WHERE is_latest = true AND (event_id, market_key, book_key, outcome_name) IN (...)
+
+	query := `
+		UPDATE odds_raw 
+		SET is_latest = false 
+		WHERE is_latest = true 
+		  AND (event_id, market_key, book_key, outcome_name) IN (
+			SELECT UNNEST($1::text[]), UNNEST($2::text[]), UNNEST($3::text[]), UNNEST($4::text[])
+		  )
+	`
+
+	eventIDs := make([]string, len(odds))
+	marketKeys := make([]string, len(odds))
+	bookKeys := make([]string, len(odds))
+	outcomeNames := make([]string, len(odds))
+
+	for i, odd := range odds {
+		eventIDs[i] = odd.EventID
+		marketKeys[i] = odd.MarketKey
+		bookKeys[i] = odd.BookKey
+		outcomeNames[i] = odd.OutcomeName
+	}
+
+	_, err := tx.ExecContext(ctx, query, pq.Array(eventIDs), pq.Array(marketKeys), pq.Array(bookKeys), pq.Array(outcomeNames))
+	return err
+}
+
+// insertNewOdds inserts new odds rows with is_latest = true
+func (w *Writer) insertNewOdds(ctx context.Context, tx *sql.Tx, odds []models.RawOdds) error {
+	if len(odds) == 0 {
+		return nil
+	}
+
+	// Build INSERT statement with UNNEST for batch insert
+	query := `
+		INSERT INTO odds_raw (
+			event_id, sport_key, market_key, book_key, outcome_name,
+			price, point, vendor_last_update, received_at, is_latest
+		)
+		SELECT * FROM UNNEST(
+			$1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
+			$6::int[], $7::decimal[], $8::timestamptz[], $9::timestamptz[], $10::boolean[]
+		)
+	`
+
+	eventIDs := make([]string, len(odds))
+	sportKeys := make([]string, len(odds))
+	marketKeys := make([]string, len(odds))
+	bookKeys := make([]string, len(odds))
+	outcomeNames := make([]string, len(odds))
+	prices := make([]int, len(odds))
+	points := make([]*float64, len(odds))
+	vendorUpdates := make([]time.Time, len(odds))
+	receivedAts := make([]time.Time, len(odds))
+	isLatests := make([]bool, len(odds))
+
+	for i, odd := range odds {
+		eventIDs[i] = odd.EventID
+		sportKeys[i] = odd.SportKey
+		marketKeys[i] = odd.MarketKey
+		bookKeys[i] = odd.BookKey
+		outcomeNames[i] = odd.OutcomeName
+		prices[i] = odd.Price
+		points[i] = odd.Point
+		vendorUpdates[i] = odd.VendorLastUpdate
+		receivedAts[i] = odd.ReceivedAt
+		isLatests[i] = true
+	}
+
+	_, err := tx.ExecContext(ctx, query,
+		pq.Array(eventIDs), pq.Array(sportKeys), pq.Array(marketKeys), pq.Array(bookKeys), pq.Array(outcomeNames),
+		pq.Array(prices), pq.Array(points), pq.Array(vendorUpdates), pq.Array(receivedAts), pq.Array(isLatests),
+	)
+
+	return err
+}
+
+// publishToStream publishes odds deltas to Redis Stream
+func (w *Writer) publishToStream(ctx context.Context, odds []models.RawOdds) error {
+	if len(odds) == 0 {
+		return nil
+	}
+
+	// Group by sport for separate streams
+	bySport := make(map[string][]models.RawOdds)
+	for _, odd := range odds {
+		bySport[odd.SportKey] = append(bySport[odd.SportKey], odd)
+	}
+
+	// Publish to each sport's stream
+	for sportKey, sportOdds := range bySport {
+		streamKey := fmt.Sprintf(streamKeyFormat, sportKey)
+
+		pipe := w.redis.Pipeline()
+
+		for _, odd := range sportOdds {
+			msg := StreamMessage{
+				EventID:          odd.EventID,
+				SportKey:         odd.SportKey,
+				MarketKey:        odd.MarketKey,
+				BookKey:          odd.BookKey,
+				OutcomeName:      odd.OutcomeName,
+				Price:            odd.Price,
+				Point:            odd.Point,
+				VendorLastUpdate: odd.VendorLastUpdate,
+				ReceivedAt:       odd.ReceivedAt,
+			}
+
+			msgJSON, err := json.Marshal(msg)
+			if err != nil {
+				return fmt.Errorf("marshal stream message: %w", err)
+			}
+
+			pipe.XAdd(ctx, &redis.XAddArgs{
+				Stream: streamKey,
+				Values: map[string]interface{}{
+					"data": msgJSON,
+				},
+			})
+		}
+
+		_, err := pipe.Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("redis pipeline exec for stream: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// upsertEventsFromList inserts or updates events in the events table
+func (w *Writer) upsertEventsFromList(ctx context.Context, tx *sql.Tx, events []models.Event) error {
+	if len(events) == 0 {
+		return nil
+	}
+
+	// Build UPSERT statement using UNNEST for batch insert
+	query := `
+		INSERT INTO events (
+			event_id, sport_key, home_team, away_team, commence_time, event_status
+		)
+		SELECT UNNEST($1::text[]), UNNEST($2::text[]), UNNEST($3::text[]), 
+		       UNNEST($4::text[]), UNNEST($5::timestamptz[]), UNNEST($6::text[])
+		ON CONFLICT (event_id) 
+		DO UPDATE SET 
+			home_team = EXCLUDED.home_team,
+			away_team = EXCLUDED.away_team,
+			commence_time = EXCLUDED.commence_time,
+			event_status = EXCLUDED.event_status
+	`
+
+	eventIDs := make([]string, len(events))
+	sportKeys := make([]string, len(events))
+	homeTeams := make([]string, len(events))
+	awayTeams := make([]string, len(events))
+	commenceTimes := make([]time.Time, len(events))
+	statuses := make([]string, len(events))
+
+	for i, evt := range events {
+		eventIDs[i] = evt.EventID
+		sportKeys[i] = evt.SportKey
+		homeTeams[i] = evt.HomeTeam
+		awayTeams[i] = evt.AwayTeam
+		commenceTimes[i] = evt.CommenceTime
+		statuses[i] = evt.EventStatus
+	}
+
+	_, err := tx.ExecContext(ctx, query, 
+		pq.Array(eventIDs), pq.Array(sportKeys), pq.Array(homeTeams), 
+		pq.Array(awayTeams), pq.Array(commenceTimes), pq.Array(statuses),
+	)
+
+	return err
+}
+
+// upsertBooksFromOdds extracts unique books from odds and inserts them if they don't exist
+func (w *Writer) upsertBooksFromOdds(ctx context.Context, tx *sql.Tx, odds []models.RawOdds) error {
+	if len(odds) == 0 {
+		return nil
+	}
+
+	// Extract unique books
+	bookMap := make(map[string]string) // book_key -> sport_key
+	for _, odd := range odds {
+		bookMap[odd.BookKey] = odd.SportKey
+	}
+
+	if len(bookMap) == 0 {
+		return nil
+	}
+
+	// Build UPSERT statement for books
+	// We'll insert with minimal info and let manual seed data provide full details
+	query := `
+		INSERT INTO books (book_key, display_name, book_type, active, regions, supported_sports)
+		SELECT UNNEST($1::text[]), UNNEST($2::text[]), 'soft', true, ARRAY['us'], ARRAY[UNNEST($3::text[])]
+		ON CONFLICT (book_key) DO NOTHING
+	`
+
+	bookKeys := make([]string, 0, len(bookMap))
+	displayNames := make([]string, 0, len(bookMap))
+	sportKeys := make([]string, 0, len(bookMap))
+
+	for bookKey, sportKey := range bookMap {
+		bookKeys = append(bookKeys, bookKey)
+		// Capitalize first letter for display name
+		displayNames = append(displayNames, capitalizeFirst(bookKey))
+		sportKeys = append(sportKeys, sportKey)
+	}
+
+	_, err := tx.ExecContext(ctx, query, 
+		pq.Array(bookKeys), pq.Array(displayNames), pq.Array(sportKeys),
+	)
+
+	return err
+}
+
+// capitalizeFirst capitalizes the first letter of a string
+func capitalizeFirst(s string) string {
+	if len(s) == 0 {
+		return s
+	}
+	if s[0] >= 'a' && s[0] <= 'z' {
+		return string(s[0]-32) + s[1:]
+	}
+	return s
+}
+

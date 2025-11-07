@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/XavierBriggs/Mercury/adapters/theoddsapi"
+	"github.com/XavierBriggs/Mercury/internal/registry"
 	"github.com/XavierBriggs/Mercury/internal/scheduler"
+	"github.com/XavierBriggs/Mercury/sports/basketball_nba"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
@@ -57,8 +59,20 @@ func main() {
 
 	fmt.Println("✓ Initialized The Odds API adapter")
 
+	// Initialize sport registry and register active sports
+	sportRegistry := registry.NewSportRegistry()
+	
+	// Register NBA
+	nbaModule := basketball_nba.NewModule()
+	if err := sportRegistry.Register(nbaModule); err != nil {
+		fmt.Printf("failed to register NBA module: %v\n", err)
+		os.Exit(1)
+	}
+	
+	fmt.Printf("✓ Registered %d sport(s)\n", sportRegistry.Count())
+
 	// Initialize scheduler
-	sched := scheduler.NewScheduler(db, redisClient, adapter, config.CacheTTL)
+	sched := scheduler.NewScheduler(db, redisClient, adapter, config.CacheTTL, sportRegistry)
 
 	// Start scheduler
 	if err := sched.Start(ctx); err != nil {
@@ -66,11 +80,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("✓ Mercury started - polling NBA odds")
-	fmt.Printf("  Regions: us, us2\n")
-	fmt.Printf("  Markets: h2h, spreads, totals\n")
-	fmt.Printf("  Props discovery: every 6 hours\n")
+	fmt.Println("✓ Mercury started - polling odds")
 	fmt.Printf("  Cache TTL: %v\n", config.CacheTTL)
+	fmt.Println()
+	
+	// Show registered sports
+	for _, sport := range sportRegistry.GetAll() {
+		fmt.Printf("  [%s]\n", sport.GetDisplayName())
+		fmt.Printf("    Regions: %v\n", sport.GetRegions())
+		fmt.Printf("    Markets: %v\n", sport.GetFeaturedMarkets())
+		fmt.Printf("    Poll Interval: %v\n", sport.GetFeaturedPollInterval())
+		if sport.ShouldPollProps() {
+			fmt.Printf("    Props Discovery: every %v\n", sport.GetPropsDiscoveryInterval())
+		}
+	}
 
 	// Wait for interrupt signal
 	sigChan := make(chan os.Signal, 1)

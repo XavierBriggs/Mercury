@@ -59,6 +59,129 @@ Mercury is a high-performance odds aggregation service that polls vendor APIs, d
   - 2NF/3NF normalized schema
   - `is_latest` flag for fast current odds queries
 
+## Modular Architecture & Expansion
+
+Mercury uses a **Sport Registry pattern** to support multiple sports without modifying core code. Each sport is a pluggable module that implements the `SportModule` interface.
+
+### Sport Module Interface
+
+```go
+type SportModule interface {
+    GetSportKey() string                      // "basketball_nba"
+    GetDisplayName() string                   // "NBA Basketball"
+    GetFeaturedMarkets() []string             // ["h2h", "spreads", "totals"]
+    GetRegions() []string                     // ["us", "us2"]
+    GetFeaturedPollInterval() time.Duration   // 60s
+    GetPropsPollInterval() time.Duration      // 30min
+    GetPropsDiscoveryInterval() time.Duration // 6h
+    GetPropsDiscoveryWindowHours() int        // 48
+    ShouldPollProps() bool                    // true
+    ValidateOdds(odds RawOdds) error          // Sport-specific validation
+}
+```
+
+### Current Sports
+
+| Sport | Status | Poll Interval | Markets | Props |
+|-------|--------|---------------|---------|-------|
+| **NBA** | ✅ Active (v0) | 60s | h2h, spreads, totals | ✅ Enabled |
+| **NFL** | 🔜 Planned (v1) | 30s | h2h, spreads, totals, alt_lines | ✅ Enabled |
+| **MLB** | 🔜 Planned (v1) | 90s | h2h, run_lines, totals, f5_innings | ✅ Enabled |
+
+### Adding a New Sport
+
+**1. Create Sport Module** (`sports/american_football_nfl/`)
+
+```go
+// sports/american_football_nfl/module.go
+type Module struct {
+    config *Config
+}
+
+func NewModule() *Module {
+    return &Module{config: DefaultConfig()}
+}
+
+func (m *Module) GetSportKey() string {
+    return "american_football_nfl"
+}
+
+func (m *Module) GetFeaturedPollInterval() time.Duration {
+    return 30 * time.Second  // NFL lines move faster
+}
+
+// Implement remaining SportModule methods...
+```
+
+**2. Create Sport Configuration** (`sports/american_football_nfl/config.go`)
+
+```go
+func DefaultConfig() *Config {
+    return &Config{
+        SportKey:    "american_football_nfl",
+        DisplayName: "NFL Football",
+        Regions:     []string{"us"},
+        Featured: FeaturedConfig{
+            PollInterval: 30 * time.Second,  // Faster than NBA
+        },
+        // NFL-specific config...
+    }
+}
+```
+
+**3. Register Sport in `main.go`**
+
+```go
+// Initialize sport registry
+sportRegistry := registry.NewSportRegistry()
+
+// Register NBA
+nbaModule := basketball_nba.NewModule()
+sportRegistry.Register(nbaModule)
+
+// Register NFL (future)
+nflModule := american_football_nfl.NewModule()
+sportRegistry.Register(nflModule)
+
+// Mercury automatically polls both sports! ✅
+```
+
+**That's it!** No changes to scheduler, delta engine, or writer needed. Each sport runs independently with its own polling intervals and configuration.
+
+### Why This Architecture?
+
+1. **🔌 Pluggable** - Add/remove sports without touching core code
+2. **⚙️ Sport-Specific Config** - Each sport defines its own polling strategy
+3. **🧪 Testable** - Mock sport modules for unit testing
+4. **📈 Scalable** - Sports run in parallel goroutines
+5. **🎯 Domain Expertise** - Betting characteristics vary by sport:
+   - **NBA**: Fast line movement (60s), props discovery every 6h
+   - **NFL**: Very fast movement (30s), weekly schedule (12h discovery)
+   - **MLB**: Slower lines (90s), daily games (24h discovery)
+
+### Sport-Specific Polling Examples
+
+**NBA Basketball** (High Volatility)
+```
+Featured: 60s → 40s (ramp) → 40s (live)
+Props: 30min → 1min (near tipoff)
+Discovery: Every 6 hours (48hr window)
+```
+
+**NFL Football** (Extreme Volatility - Future)
+```
+Featured: 30s → 20s (ramp) → 20s (live)
+Props: 15min → 30s (near kickoff)
+Discovery: Every 12 hours (weekly schedule)
+```
+
+**MLB Baseball** (Lower Volatility - Future)
+```
+Featured: 90s → 60s (ramp) → 60s (live)
+Props: 20min → 2min (near first pitch)
+Discovery: Every 24 hours (daily games)
+```
+
 ## Quick Start
 
 ### Prerequisites

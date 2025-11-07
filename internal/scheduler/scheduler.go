@@ -9,19 +9,19 @@ import (
 	"time"
 
 	"github.com/XavierBriggs/Mercury/internal/delta"
+	"github.com/XavierBriggs/Mercury/internal/registry"
 	"github.com/XavierBriggs/Mercury/internal/writer"
 	"github.com/XavierBriggs/Mercury/pkg/contracts"
 	"github.com/XavierBriggs/Mercury/pkg/models"
-	"github.com/XavierBriggs/Mercury/sports/basketball_nba"
 	"github.com/redis/go-redis/v9"
 )
 
-// Scheduler orchestrates polling for all active sports
+// Scheduler orchestrates polling for all registered sports
 type Scheduler struct {
 	adapter      contracts.VendorAdapter
 	deltaEngine  *delta.Engine
 	writer       *writer.Writer
-	nbaConfig    *basketball_nba.Config
+	sportRegistry *registry.SportRegistry
 	stopChan     chan struct{}
 	wg           sync.WaitGroup
 }
@@ -32,34 +32,47 @@ func NewScheduler(
 	redisClient *redis.Client,
 	adapter contracts.VendorAdapter,
 	cacheTTL time.Duration,
+	sportRegistry *registry.SportRegistry,
 ) *Scheduler {
 	return &Scheduler{
-		adapter:     adapter,
-		deltaEngine: delta.NewEngine(redisClient, cacheTTL),
-		writer:      writer.NewWriter(db, redisClient),
-		nbaConfig:   basketball_nba.DefaultConfig(),
-		stopChan:    make(chan struct{}),
+		adapter:       adapter,
+		deltaEngine:   delta.NewEngine(redisClient, cacheTTL),
+		writer:        writer.NewWriter(db, redisClient),
+		sportRegistry: sportRegistry,
+		stopChan:      make(chan struct{}),
 	}
 }
 
-// Start begins polling for all active sports
+// Start begins polling for all registered sports
 func (s *Scheduler) Start(ctx context.Context) error {
 	// Start writer's background flush
 	s.writer.Start(ctx)
 
-	// Start NBA featured markets polling
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.pollNBAFeatured(ctx)
-	}()
+	// Start polling for each registered sport
+	sports := s.sportRegistry.GetAll()
+	if len(sports) == 0 {
+		return fmt.Errorf("no sports registered")
+	}
 
-	// Start NBA props discovery sweep
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-		s.discoverNBAProps(ctx)
-	}()
+	for _, sport := range sports {
+		// Start featured markets polling for this sport
+		s.wg.Add(1)
+		go func(sport contracts.SportModule) {
+			defer s.wg.Done()
+			s.pollSportFeatured(ctx, sport)
+		}(sport)
+
+		// Start props discovery if enabled for this sport
+		if sport.ShouldPollProps() {
+			s.wg.Add(1)
+			go func(sport contracts.SportModule) {
+				defer s.wg.Done()
+				s.discoverSportProps(ctx, sport)
+			}(sport)
+		}
+
+		fmt.Printf("✓ Started polling for %s\n", sport.GetDisplayName())
+	}
 
 	return nil
 }
@@ -71,34 +84,34 @@ func (s *Scheduler) Stop() {
 	s.writer.Stop()
 }
 
-// pollNBAFeatured polls featured markets (h2h, spreads, totals) with Plan A cadence
-func (s *Scheduler) pollNBAFeatured(ctx context.Context) {
+// pollSportFeatured polls featured markets for a specific sport
+func (s *Scheduler) pollSportFeatured(ctx context.Context, sport contracts.SportModule) {
 	// Initial poll immediately
 	if err := s.fetchAndProcess(ctx, &models.FetchOddsOptions{
-		Sport:   s.nbaConfig.SportKey,
-		Regions: s.nbaConfig.Regions,
-		Markets: basketball_nba.FeaturedMarkets(),
+		Sport:   sport.GetSportKey(),
+		Regions: sport.GetRegions(),
+		Markets: sport.GetFeaturedMarkets(),
 	}); err != nil {
-		fmt.Printf("initial featured poll error: %v\n", err)
+		fmt.Printf("[%s] initial featured poll error: %v\n", sport.GetDisplayName(), err)
 	}
 
-	// Dynamic ticker based on event times
-	ticker := time.NewTicker(60 * time.Second) // Start with pre-match interval
+	// Dynamic ticker based on sport configuration
+	ticker := time.NewTicker(sport.GetFeaturedPollInterval())
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			if err := s.fetchAndProcess(ctx, &models.FetchOddsOptions{
-				Sport:   s.nbaConfig.SportKey,
-				Regions: s.nbaConfig.Regions,
-				Markets: basketball_nba.FeaturedMarkets(),
+				Sport:   sport.GetSportKey(),
+				Regions: sport.GetRegions(),
+				Markets: sport.GetFeaturedMarkets(),
 			}); err != nil {
-				fmt.Printf("featured poll error: %v\n", err)
+				fmt.Printf("[%s] featured poll error: %v\n", sport.GetDisplayName(), err)
 			}
 
 			// TODO: Adjust ticker interval based on nearest event time
-			// For v0, using fixed 60s interval (will enhance in I3)
+			// For v0, using fixed intervals (will enhance in I3)
 
 		case <-s.stopChan:
 			return
@@ -108,21 +121,21 @@ func (s *Scheduler) pollNBAFeatured(ctx context.Context) {
 	}
 }
 
-// discoverNBAProps performs discovery sweep for props every 6 hours
-func (s *Scheduler) discoverNBAProps(ctx context.Context) {
-	ticker := time.NewTicker(s.nbaConfig.Props.DiscoverySweepInterval)
+// discoverSportProps performs discovery sweep for props
+func (s *Scheduler) discoverSportProps(ctx context.Context, sport contracts.SportModule) {
+	ticker := time.NewTicker(sport.GetPropsDiscoveryInterval())
 	defer ticker.Stop()
 
 	// Initial discovery immediately
-	if err := s.discoverProps(ctx); err != nil {
-		fmt.Printf("initial props discovery error: %v\n", err)
+	if err := s.discoverProps(ctx, sport); err != nil {
+		fmt.Printf("[%s] initial props discovery error: %v\n", sport.GetDisplayName(), err)
 	}
 
 	for {
 		select {
 		case <-ticker.C:
-			if err := s.discoverProps(ctx); err != nil {
-				fmt.Printf("props discovery error: %v\n", err)
+			if err := s.discoverProps(ctx, sport); err != nil {
+				fmt.Printf("[%s] props discovery error: %v\n", sport.GetDisplayName(), err)
 			}
 
 		case <-s.stopChan:
@@ -133,16 +146,16 @@ func (s *Scheduler) discoverNBAProps(ctx context.Context) {
 	}
 }
 
-// discoverProps fetches upcoming events and schedules props polling
-func (s *Scheduler) discoverProps(ctx context.Context) error {
-	events, err := s.adapter.FetchEvents(ctx, s.nbaConfig.SportKey)
+// discoverProps fetches upcoming events and schedules props polling for a sport
+func (s *Scheduler) discoverProps(ctx context.Context, sport contracts.SportModule) error {
+	events, err := s.adapter.FetchEvents(ctx, sport.GetSportKey())
 	if err != nil {
 		return fmt.Errorf("fetch events: %w", err)
 	}
 
-	// Filter events within 48hr window
+	// Filter events within discovery window
 	now := time.Now()
-	windowEnd := now.Add(time.Duration(s.nbaConfig.Props.DiscoveryWindowHours) * time.Hour)
+	windowEnd := now.Add(time.Duration(sport.GetPropsDiscoveryWindowHours()) * time.Hour)
 
 	eventsInWindow := make([]models.Event, 0)
 	for _, evt := range events {
@@ -151,7 +164,8 @@ func (s *Scheduler) discoverProps(ctx context.Context) error {
 		}
 	}
 
-	fmt.Printf("discovered %d events in next 48hr window\n", len(eventsInWindow))
+	fmt.Printf("[%s] discovered %d events in next %dhr window\n", 
+		sport.GetDisplayName(), len(eventsInWindow), sport.GetPropsDiscoveryWindowHours())
 
 	// TODO: Store discovered events and schedule ramped polling
 	// For v0, will implement full ramping in I3

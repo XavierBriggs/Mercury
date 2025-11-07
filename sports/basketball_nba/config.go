@@ -7,7 +7,8 @@ import (
 // Config contains NBA-specific polling configuration (Plan A from Phase 3)
 type Config struct {
 	// Sport identification
-	SportKey string
+	SportKey    string
+	DisplayName string
 
 	// Regions to poll
 	Regions []string
@@ -21,6 +22,9 @@ type Config struct {
 
 // FeaturedConfig defines polling for mainline markets
 type FeaturedConfig struct {
+	// Default polling interval (used by scheduler)
+	PollInterval time.Duration
+
 	// Pre-match polling interval (>6hr from start)
 	PreMatchInterval time.Duration
 
@@ -36,6 +40,12 @@ type FeaturedConfig struct {
 
 // PropsConfig defines polling for player props
 type PropsConfig struct {
+	// Enable props polling
+	Enabled bool
+
+	// Default polling interval (used by scheduler)
+	PollInterval time.Duration
+
 	// Discovery sweep configuration
 	DiscoverySweepInterval time.Duration
 	DiscoveryWindowHours   int
@@ -63,10 +73,12 @@ type RampTier struct {
 // DefaultConfig returns the Plan A configuration from Phase 3
 func DefaultConfig() *Config {
 	return &Config{
-		SportKey: "basketball_nba",
-		Regions:  []string{"us", "us2"},
+		SportKey:    "basketball_nba",
+		DisplayName: "NBA Basketball",
+		Regions:     []string{"us", "us2"},
 
 		Featured: FeaturedConfig{
+			PollInterval:       60 * time.Second, // Default pre-match interval
 			PreMatchInterval:   60 * time.Second,
 			RampWithinHours:    6.0,
 			RampTargetInterval: 40 * time.Second,
@@ -74,6 +86,8 @@ func DefaultConfig() *Config {
 		},
 
 		Props: PropsConfig{
+			Enabled:                true,
+			PollInterval:           30 * time.Minute, // Default props interval
 			DiscoverySweepInterval: 6 * time.Hour,
 			DiscoveryWindowHours:   48,
 

@@ -18,3 +18,4 @@ COMMENT ON TABLE sports IS 'Reference table for supported sports (basketball_nba
 COMMENT ON COLUMN sports.sport_key IS 'Unique identifier matching vendor sport key';
 COMMENT ON COLUMN sports.config IS 'Sport-specific polling configuration (Plan A cadence, etc.)';
 
+

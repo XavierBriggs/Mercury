@@ -20,3 +20,4 @@ INSERT INTO books (book_key, display_name, book_type, active, regions, supported
 ('mybookieag', 'MyBookie.ag', 'soft', true, ARRAY['us'], ARRAY['basketball_nba', 'american_football_nfl', 'baseball_mlb'])
 ON CONFLICT (book_key) DO NOTHING;
 
+

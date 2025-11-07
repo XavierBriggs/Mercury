@@ -28,3 +28,4 @@ INSERT INTO sports (sport_key, display_name, active, config) VALUES
 ('baseball_mlb', 'MLB Baseball', false, null)
 ON CONFLICT (sport_key) DO NOTHING;
 
+

@@ -24,3 +24,4 @@ COMMENT ON COLUMN events.event_id IS 'Vendor-provided unique event identifier';
 COMMENT ON COLUMN events.event_status IS 'Current status: upcoming, live, completed, cancelled';
 COMMENT ON COLUMN events.last_seen_at IS 'Last time this event was seen in vendor responses (for cleanup)';
 
+

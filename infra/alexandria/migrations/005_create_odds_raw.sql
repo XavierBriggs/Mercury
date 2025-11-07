@@ -35,3 +35,4 @@ COMMENT ON COLUMN odds_raw.point IS 'Spread/total line (e.g., -3.5, 223.5) - NUL
 COMMENT ON COLUMN odds_raw.vendor_last_update IS 'Timestamp from vendor headers (for staleness tracking)';
 COMMENT ON COLUMN odds_raw.is_latest IS 'TRUE for current odds, FALSE for historical. Enables fast queries without MAX(received_at) GROUP BY';
 
+

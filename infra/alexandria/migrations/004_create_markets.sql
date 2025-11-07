@@ -22,3 +22,4 @@ COMMENT ON COLUMN markets.market_key IS 'Unique market identifier (h2h, spreads,
 COMMENT ON COLUMN markets.market_family IS 'featured = mainline markets; props = player/game props';
 COMMENT ON COLUMN markets.outcome_count IS 'Expected number of outcomes (2 for spreads, 3 for h2h, etc.)';
 
+

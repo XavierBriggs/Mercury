@@ -24,3 +24,4 @@ COMMENT ON COLUMN books.book_type IS 'sharp = fast, efficient, low limits; soft 
 COMMENT ON COLUMN books.regions IS 'Array of regions where book operates (us, us2, uk, etc.)';
 COMMENT ON COLUMN books.supported_sports IS 'Array of sport_keys this book covers';
 
+

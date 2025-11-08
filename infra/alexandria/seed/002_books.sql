@@ -3,7 +3,7 @@
 
 INSERT INTO books (book_key, display_name, book_type, active, regions, supported_sports) VALUES
 -- Sharp books (fast, efficient, low limits, used for fair price baseline)
-('pinnacle', 'Pinnacle', 'sharp', true, ARRAY['us'], ARRAY['basketball_nba', 'american_football_nfl', 'baseball_mlb']),
+('pinnacle', 'Pinnacle', 'sharp', true, ARRAY['eu'], ARRAY['basketball_nba', 'american_football_nfl', 'baseball_mlb']),
 ('circa', 'Circa Sports', 'sharp', true, ARRAY['us'], ARRAY['basketball_nba', 'american_football_nfl', 'baseball_mlb']),
 ('bookmaker', 'Bookmaker', 'sharp', true, ARRAY['us'], ARRAY['basketball_nba', 'american_football_nfl', 'baseball_mlb']),
 

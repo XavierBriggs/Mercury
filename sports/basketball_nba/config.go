@@ -75,7 +75,7 @@ func DefaultConfig() *Config {
 	return &Config{
 		SportKey:    "basketball_nba",
 		DisplayName: "NBA Basketball",
-		Regions:     []string{"us", "us2"},
+		Regions:     []string{"us", "us2", "eu"}, // Added EU for Pinnacle
 
 		Featured: FeaturedConfig{
 			PollInterval:       60 * time.Second, // Default pre-match interval

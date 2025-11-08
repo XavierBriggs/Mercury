@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -114,6 +115,10 @@ func (w *Writer) WriteWithEvents(ctx context.Context, events []models.Event, odd
 	if len(events) == 0 && len(odds) == 0 {
 		return nil
 	}
+
+	// Filter odds: Only accept Pinnacle from EU region books
+	// All US/US2 books are accepted automatically
+	odds = filterEUBooks(odds)
 
 	// Execute write in transaction immediately (bypass buffer)
 	tx, err := w.db.BeginTx(ctx, nil)
@@ -442,5 +447,63 @@ func capitalizeFirst(s string) string {
 		return string(s[0]-32) + s[1:]
 	}
 	return s
+}
+
+// filterEUBooks only accepts Pinnacle from EU region books
+// This prevents foreign key errors from unknown EU bookmakers
+func filterEUBooks(odds []models.RawOdds) []models.RawOdds {
+	// EU books we want to accept (currently only Pinnacle)
+	allowedEUBooks := map[string]bool{
+		"pinnacle": true,
+	}
+
+	filtered := make([]models.RawOdds, 0, len(odds))
+	for _, odd := range odds {
+		bookKey := strings.ToLower(odd.BookKey)
+		
+		// Check if this is a known EU-only book
+		// If it's an allowed EU book OR any other book (US/US2), accept it
+		// This filters out unknown EU books while keeping Pinnacle
+		if isEUOnlyBook(bookKey) {
+			// Only accept if in allowed list
+			if allowedEUBooks[bookKey] {
+				filtered = append(filtered, odd)
+			}
+			// Otherwise skip this book
+		} else {
+			// Not an EU-only book, accept it (US/US2 books)
+			filtered = append(filtered, odd)
+		}
+	}
+	
+	return filtered
+}
+
+// isEUOnlyBook checks if a book is EU-exclusive
+// US books that also appear in EU are NOT considered EU-only
+func isEUOnlyBook(bookKey string) bool {
+	euOnlyBooks := map[string]bool{
+		"pinnacle":        true,
+		"betfair_ex_eu":   true,
+		"matchbook":       true,
+		"marathonbet":     true,
+		"betsson":         true,
+		"coolbet":         true,
+		"nordicbet":       true,
+		"unibet_se":       true,
+		"unibet_fr":       true,
+		"unibet_it":       true,
+		"unibet_nl":       true,
+		"leovegas_se":     true,
+		"tipico_de":       true,
+		"winamax_fr":      true,
+		"winamax_de":      true,
+		"betclic_fr":      true,
+		"parionssport_fr": true,
+		"suprabets":       true,
+		"onexbet":         true,
+	}
+	
+	return euOnlyBooks[bookKey]
 }
 

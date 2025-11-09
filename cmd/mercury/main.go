@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/XavierBriggs/Mercury/adapters/theoddsapi"
+	"github.com/XavierBriggs/Mercury/internal/closer"
 	"github.com/XavierBriggs/Mercury/internal/registry"
 	"github.com/XavierBriggs/Mercury/internal/scheduler"
 	"github.com/XavierBriggs/Mercury/sports/basketball_nba"
@@ -80,8 +81,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize and start closing line capturer
+	capturer := closer.NewCapturer(db, redisClient, config.ClosingLinePollInterval)
+	go capturer.Start(ctx)
+
 	fmt.Println("✓ Mercury started - polling odds")
 	fmt.Printf("  Cache TTL: %v\n", config.CacheTTL)
+	fmt.Printf("  Closing Line Poll: %v\n", config.ClosingLinePollInterval)
 	fmt.Println()
 	
 	// Show registered sports
@@ -107,6 +113,7 @@ func main() {
 	defer cancel()
 
 	sched.Stop()
+	capturer.Stop()
 
 	select {
 	case <-shutdownCtx.Done():
@@ -119,11 +126,12 @@ func main() {
 
 // Config holds Mercury configuration
 type Config struct {
-	AlexandriaDSN string
-	RedisURL      string
-	RedisPassword string
-	OddsAPIKey    string
-	CacheTTL      time.Duration
+	AlexandriaDSN           string
+	RedisURL                string
+	RedisPassword           string
+	OddsAPIKey              string
+	CacheTTL                time.Duration
+	ClosingLinePollInterval time.Duration
 }
 
 // loadConfig loads configuration from environment variables
@@ -138,12 +146,23 @@ func loadConfig() Config {
 		}
 	}
 
+	// Parse closing line poll interval (default 30 seconds)
+	closingLinePollInterval := 30 * time.Second
+	if intervalStr := os.Getenv("CLOSING_LINE_POLL_INTERVAL"); intervalStr != "" {
+		if parsed, err := time.ParseDuration(intervalStr); err == nil {
+			closingLinePollInterval = parsed
+		} else {
+			fmt.Printf("⚠ Invalid CLOSING_LINE_POLL_INTERVAL '%s', using default 30s\n", intervalStr)
+		}
+	}
+
 	config := Config{
-		AlexandriaDSN: getEnv("ALEXANDRIA_DSN", "postgres://fortuna:fortuna@localhost:5432/alexandria?sslmode=disable"),
-		RedisURL:      getEnv("REDIS_URL", "localhost:6379"),
-		RedisPassword: os.Getenv("REDIS_PASSWORD"),
-		OddsAPIKey:    getEnv("ODDS_API_KEY", ""),
-		CacheTTL:      cacheTTL,
+		AlexandriaDSN:           getEnv("ALEXANDRIA_DSN", "postgres://fortuna:fortuna@localhost:5432/alexandria?sslmode=disable"),
+		RedisURL:                getEnv("REDIS_URL", "localhost:6379"),
+		RedisPassword:           os.Getenv("REDIS_PASSWORD"),
+		OddsAPIKey:              getEnv("ODDS_API_KEY", ""),
+		CacheTTL:                cacheTTL,
+		ClosingLinePollInterval: closingLinePollInterval,
 	}
 
 	if config.OddsAPIKey == "" {

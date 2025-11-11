@@ -29,3 +29,4 @@ INSERT INTO sports (sport_key, display_name, active, config) VALUES
 ON CONFLICT (sport_key) DO NOTHING;
 
 
+

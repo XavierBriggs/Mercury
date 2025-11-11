@@ -25,3 +25,4 @@ COMMENT ON COLUMN events.event_status IS 'Current status: upcoming, live, comple
 COMMENT ON COLUMN events.last_seen_at IS 'Last time this event was seen in vendor responses (for cleanup)';
 
 
+

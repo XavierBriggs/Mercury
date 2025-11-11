@@ -19,3 +19,4 @@ COMMENT ON COLUMN sports.sport_key IS 'Unique identifier matching vendor sport k
 COMMENT ON COLUMN sports.config IS 'Sport-specific polling configuration (Plan A cadence, etc.)';
 
 
+

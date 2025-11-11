@@ -25,3 +25,4 @@ COMMENT ON COLUMN books.regions IS 'Array of regions where book operates (us, us
 COMMENT ON COLUMN books.supported_sports IS 'Array of sport_keys this book covers';
 
 
+

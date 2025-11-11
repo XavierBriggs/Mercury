@@ -36,3 +36,4 @@ COMMENT ON COLUMN odds_raw.vendor_last_update IS 'Timestamp from vendor headers 
 COMMENT ON COLUMN odds_raw.is_latest IS 'TRUE for current odds, FALSE for historical. Enables fast queries without MAX(received_at) GROUP BY';
 
 
+

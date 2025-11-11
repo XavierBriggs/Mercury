@@ -23,3 +23,4 @@ COMMENT ON COLUMN markets.market_family IS 'featured = mainline markets; props =
 COMMENT ON COLUMN markets.outcome_count IS 'Expected number of outcomes (2 for spreads, 3 for h2h, etc.)';
 
 
+

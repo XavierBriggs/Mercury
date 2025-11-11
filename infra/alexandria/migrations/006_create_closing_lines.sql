@@ -22,3 +22,4 @@ COMMENT ON COLUMN closing_lines.closing_price IS 'American odds at the moment ev
 COMMENT ON COLUMN closing_lines.closed_at IS 'Timestamp when line was captured (typically event commence_time)';
 
 
+

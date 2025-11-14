@@ -81,12 +81,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Initialize and start event status updater
+	statusUpdater := closer.NewStatusUpdater(db, config.StatusUpdateInterval)
+	go statusUpdater.Start(ctx)
+
 	// Initialize and start closing line capturer
 	capturer := closer.NewCapturer(db, redisClient, config.ClosingLinePollInterval)
 	go capturer.Start(ctx)
 
 	fmt.Println("✓ Mercury started - polling odds")
 	fmt.Printf("  Cache TTL: %v\n", config.CacheTTL)
+	fmt.Printf("  Status Update Interval: %v\n", config.StatusUpdateInterval)
 	fmt.Printf("  Closing Line Poll: %v\n", config.ClosingLinePollInterval)
 	fmt.Println()
 	
@@ -113,6 +118,7 @@ func main() {
 	defer cancel()
 
 	sched.Stop()
+	statusUpdater.Stop()
 	capturer.Stop()
 
 	select {
@@ -131,6 +137,7 @@ type Config struct {
 	RedisPassword           string
 	OddsAPIKey              string
 	CacheTTL                time.Duration
+	StatusUpdateInterval    time.Duration
 	ClosingLinePollInterval time.Duration
 }
 
@@ -143,6 +150,16 @@ func loadConfig() Config {
 			cacheTTL = parsed
 		} else {
 			fmt.Printf("⚠ Invalid MERCURY_CACHE_TTL '%s', using default 5m\n", ttlStr)
+		}
+	}
+
+	// Parse status update interval (default 30 seconds)
+	statusUpdateInterval := 30 * time.Second
+	if intervalStr := os.Getenv("STATUS_UPDATE_INTERVAL"); intervalStr != "" {
+		if parsed, err := time.ParseDuration(intervalStr); err == nil {
+			statusUpdateInterval = parsed
+		} else {
+			fmt.Printf("⚠ Invalid STATUS_UPDATE_INTERVAL '%s', using default 30s\n", intervalStr)
 		}
 	}
 
@@ -162,6 +179,7 @@ func loadConfig() Config {
 		RedisPassword:           os.Getenv("REDIS_PASSWORD"),
 		OddsAPIKey:              getEnv("ODDS_API_KEY", ""),
 		CacheTTL:                cacheTTL,
+		StatusUpdateInterval:    statusUpdateInterval,
 		ClosingLinePollInterval: closingLinePollInterval,
 	}
 

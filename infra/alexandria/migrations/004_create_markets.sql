@@ -24,3 +24,4 @@ COMMENT ON COLUMN markets.outcome_count IS 'Expected number of outcomes (2 for s
 
 
 
+

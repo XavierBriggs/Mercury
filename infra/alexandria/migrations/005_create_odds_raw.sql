@@ -37,3 +37,4 @@ COMMENT ON COLUMN odds_raw.is_latest IS 'TRUE for current odds, FALSE for histor
 
 
 
+

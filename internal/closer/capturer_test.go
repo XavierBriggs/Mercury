@@ -112,3 +112,4 @@ func TestCapturer_captureClosingLines_WithLiveEvents(t *testing.T) {
 }
 
 
+

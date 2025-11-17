@@ -21,3 +21,4 @@ COMMENT ON COLUMN sports.config IS 'Sport-specific polling configuration (Plan A
 
 
 
+

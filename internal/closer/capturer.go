@@ -111,12 +111,13 @@ func (c *Capturer) captureEventClosingLines(ctx context.Context, eventID string)
 	defer tx.Rollback()
 
 	// Insert closing lines from current odds
+	// Convert NULL points to 0 for h2h markets (primary key compatibility)
 	insertQuery := `
 		INSERT INTO closing_lines (event_id, sport_key, market_key, book_key, outcome_name, closing_price, point, closed_at)
-		SELECT event_id, sport_key, market_key, book_key, outcome_name, price, point, NOW()
+		SELECT event_id, sport_key, market_key, book_key, outcome_name, price, COALESCE(point, 0), NOW()
 		FROM odds_raw
 		WHERE event_id = $1 AND is_latest = true
-		ON CONFLICT (event_id, market_key, book_key, outcome_name) DO NOTHING
+		ON CONFLICT (event_id, market_key, book_key, outcome_name, point) DO NOTHING
 	`
 
 	result, err := tx.ExecContext(ctx, insertQuery, eventID)

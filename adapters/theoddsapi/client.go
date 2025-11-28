@@ -257,13 +257,19 @@ func (c *Client) parseOddsResponse(apiResp []oddsResponse, receivedAt time.Time)
 
 		// Extract event (deduplicate by ID)
 		if !seenEvents[event.ID] {
+			// Determine if game is live based on commence_time
+			eventStatus := "upcoming"
+			if time.Now().After(commenceTime) {
+				eventStatus = "live"
+			}
+			
 			allEvents = append(allEvents, models.Event{
 				EventID:      event.ID,
 				SportKey:     event.SportKey,
 				HomeTeam:     event.HomeTeam,
 				AwayTeam:     event.AwayTeam,
 				CommenceTime: commenceTime,
-				EventStatus:  "upcoming", // Default status
+				EventStatus:  eventStatus,
 			})
 			seenEvents[event.ID] = true
 		}
@@ -316,13 +322,19 @@ func (c *Client) parseEventsResponse(apiResp []eventResponse) []models.Event {
 			continue // Skip invalid events
 		}
 
+		// Determine if game is live based on commence_time
+		eventStatus := "upcoming"
+		if time.Now().After(commenceTime) {
+			eventStatus = "live"
+		}
+
 		events = append(events, models.Event{
 			EventID:      evt.ID,
 			SportKey:     evt.SportKey,
 			HomeTeam:     evt.HomeTeam,
 			AwayTeam:     evt.AwayTeam,
 			CommenceTime: commenceTime,
-			EventStatus:  "upcoming",
+			EventStatus:  eventStatus,
 		})
 	}
 

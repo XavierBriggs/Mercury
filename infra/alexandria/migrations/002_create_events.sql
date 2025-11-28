@@ -28,3 +28,9 @@ COMMENT ON COLUMN events.last_seen_at IS 'Last time this event was seen in vendo
 
 
 
+
+
+
+
+
+

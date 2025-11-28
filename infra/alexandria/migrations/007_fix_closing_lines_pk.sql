@@ -42,3 +42,9 @@ ADD PRIMARY KEY (event_id, market_key, book_key, outcome_name, point);
 -- Verify: The table should now allow multiple rows with same outcome_name but different points
 COMMENT ON TABLE closing_lines IS 'Closing line values captured at game start for CLV analysis. Primary key includes point to allow multiple line values per outcome.';
 
+
+
+
+
+
+

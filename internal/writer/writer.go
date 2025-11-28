@@ -48,6 +48,7 @@ type StreamMessage struct {
 	Point            *float64  `json:"point,omitempty"`
 	VendorLastUpdate time.Time `json:"vendor_last_update"`
 	ReceivedAt       time.Time `json:"received_at"`
+	EventStatus      string    `json:"event_status"`    // "upcoming" or "live"
 	ChangeType       string    `json:"change_type,omitempty"`
 }
 
@@ -160,7 +161,7 @@ func (w *Writer) WriteWithEvents(ctx context.Context, events []models.Event, odd
 
 	// Step 3: Publish to Redis Streams (after successful DB write)
 	if len(odds) > 0 {
-		if err := w.publishToStream(ctx, odds); err != nil {
+		if err := w.publishToStream(ctx, odds, events); err != nil {
 			// Log but don't fail - DB is source of truth
 			fmt.Printf("publish to stream error: %v\n", err)
 		}
@@ -205,7 +206,7 @@ func (w *Writer) Flush(ctx context.Context) error {
 	}
 
 	// Step 3: Publish to Redis Streams (after successful DB write)
-	if err := w.publishToStream(ctx, odds); err != nil {
+	if err := w.publishToStream(ctx, odds, nil); err != nil {
 		// Log but don't fail - DB is source of truth
 		fmt.Printf("publish to stream error: %v\n", err)
 	}
@@ -299,9 +300,15 @@ func (w *Writer) insertNewOdds(ctx context.Context, tx *sql.Tx, odds []models.Ra
 }
 
 // publishToStream publishes odds deltas to Redis Stream
-func (w *Writer) publishToStream(ctx context.Context, odds []models.RawOdds) error {
+func (w *Writer) publishToStream(ctx context.Context, odds []models.RawOdds, events []models.Event) error {
 	if len(odds) == 0 {
 		return nil
+	}
+
+	// Build event status lookup map
+	eventStatusMap := make(map[string]string)
+	for _, event := range events {
+		eventStatusMap[event.EventID] = event.EventStatus
 	}
 
 	// Group by sport for separate streams
@@ -317,6 +324,12 @@ func (w *Writer) publishToStream(ctx context.Context, odds []models.RawOdds) err
 		pipe := w.redis.Pipeline()
 
 		for _, odd := range sportOdds {
+			// Get event status from map, default to "upcoming" if not found
+			eventStatus := eventStatusMap[odd.EventID]
+			if eventStatus == "" {
+				eventStatus = "upcoming"
+			}
+
 			msg := StreamMessage{
 				EventID:          odd.EventID,
 				SportKey:         odd.SportKey,
@@ -327,6 +340,7 @@ func (w *Writer) publishToStream(ctx context.Context, odds []models.RawOdds) err
 				Point:            odd.Point,
 				VendorLastUpdate: odd.VendorLastUpdate,
 				ReceivedAt:       odd.ReceivedAt,
+				EventStatus:      eventStatus,
 			}
 
 			msgJSON, err := json.Marshal(msg)

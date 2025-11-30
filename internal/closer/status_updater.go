@@ -101,12 +101,12 @@ func (s *StatusUpdater) updateStatuses(ctx context.Context) error {
 	// 	WHERE event_status = 'completed'
 	// 	  AND commence_time < NOW() - INTERVAL '7 days'
 	// `
-	// 
+	//
 	// cleanupResult, err := s.db.ExecContext(ctx, cleanupQuery)
 	// if err != nil {
 	// 	fmt.Printf("[StatusUpdater] cleanup warning: %v\n", err)
 	// }
-	// 
+	//
 	// cleanupCount, _ := cleanupResult.RowsAffected()
 	// if cleanupCount > 0 {
 	// 	fmt.Printf("[StatusUpdater] cleaned up %d old event(s)\n", cleanupCount)
@@ -114,4 +114,3 @@ func (s *StatusUpdater) updateStatuses(ctx context.Context) error {
 
 	return nil
 }
-

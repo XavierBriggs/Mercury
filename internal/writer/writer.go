@@ -48,7 +48,7 @@ type StreamMessage struct {
 	Point            *float64  `json:"point,omitempty"`
 	VendorLastUpdate time.Time `json:"vendor_last_update"`
 	ReceivedAt       time.Time `json:"received_at"`
-	EventStatus      string    `json:"event_status"`    // "upcoming" or "live"
+	EventStatus      string    `json:"event_status"` // "upcoming" or "live"
 	ChangeType       string    `json:"change_type,omitempty"`
 }
 
@@ -130,9 +130,13 @@ func (w *Writer) WriteWithEvents(ctx context.Context, events []models.Event, odd
 
 	// Step 0: Upsert events
 	if len(events) > 0 {
+		fmt.Printf("[Writer] Upserting %d events to update last_seen_at\n", len(events))
 		if err := w.upsertEventsFromList(ctx, tx, events); err != nil {
 			return fmt.Errorf("upsert events: %w", err)
 		}
+		fmt.Printf("[Writer] Successfully upserted %d events\n", len(events))
+	} else {
+		fmt.Printf("[Writer] WARNING: No events to upsert (len=0)\n")
 	}
 
 	// Step 0.5: Upsert books (extract from odds)
@@ -221,7 +225,7 @@ func (w *Writer) updatePreviousOdds(ctx context.Context, tx *sql.Tx, odds []mode
 	}
 
 	// Build UPDATE statement for batch
-	// UPDATE odds_raw SET is_latest = false 
+	// UPDATE odds_raw SET is_latest = false
 	// WHERE is_latest = true AND (event_id, market_key, book_key, outcome_name) IN (...)
 
 	query := `
@@ -305,10 +309,42 @@ func (w *Writer) publishToStream(ctx context.Context, odds []models.RawOdds, eve
 		return nil
 	}
 
-	// Build event status lookup map
+	// Always look up event status from database (authoritative source from StatusUpdater)
+	// The events parameter may have stale status from API parsing
 	eventStatusMap := make(map[string]string)
-	for _, event := range events {
-		eventStatusMap[event.EventID] = event.EventStatus
+	eventIDs := make([]string, 0, len(odds))
+	seenIDs := make(map[string]bool)
+	for _, odd := range odds {
+		if !seenIDs[odd.EventID] {
+			eventIDs = append(eventIDs, odd.EventID)
+			seenIDs[odd.EventID] = true
+		}
+	}
+
+	if len(eventIDs) > 0 {
+		query := `SELECT event_id, event_status FROM events WHERE event_id = ANY($1)`
+		rows, err := w.db.QueryContext(ctx, query, pq.Array(eventIDs))
+		if err != nil {
+			fmt.Printf("[Writer] ERROR looking up event status: %v\n", err)
+		} else {
+			defer rows.Close()
+			liveCount := 0
+			upcomingCount := 0
+			for rows.Next() {
+				var eventID, status string
+				if err := rows.Scan(&eventID, &status); err == nil {
+					eventStatusMap[eventID] = status
+					if status == "live" {
+						liveCount++
+					} else {
+						upcomingCount++
+					}
+				}
+			}
+			if liveCount > 0 || upcomingCount > 0 {
+				fmt.Printf("[Writer] Event status lookup: %d live, %d upcoming\n", liveCount, upcomingCount)
+			}
+		}
 	}
 
 	// Group by sport for separate streams
@@ -350,6 +386,8 @@ func (w *Writer) publishToStream(ctx context.Context, odds []models.RawOdds, eve
 
 			pipe.XAdd(ctx, &redis.XAddArgs{
 				Stream: streamKey,
+				MaxLen: 10000, // Auto-trim to prevent memory pressure and consumer group desync
+				Approx: true,  // Use ~ for efficiency (MAXLEN ~ 10000)
 				Values: map[string]interface{}{
 					"data": msgJSON,
 				},
@@ -383,7 +421,8 @@ func (w *Writer) upsertEventsFromList(ctx context.Context, tx *sql.Tx, events []
 			home_team = EXCLUDED.home_team,
 			away_team = EXCLUDED.away_team,
 			commence_time = EXCLUDED.commence_time,
-			event_status = EXCLUDED.event_status
+			event_status = EXCLUDED.event_status,
+			last_seen_at = NOW()
 	`
 
 	eventIDs := make([]string, len(events))
@@ -402,8 +441,8 @@ func (w *Writer) upsertEventsFromList(ctx context.Context, tx *sql.Tx, events []
 		statuses[i] = evt.EventStatus
 	}
 
-	_, err := tx.ExecContext(ctx, query, 
-		pq.Array(eventIDs), pq.Array(sportKeys), pq.Array(homeTeams), 
+	_, err := tx.ExecContext(ctx, query,
+		pq.Array(eventIDs), pq.Array(sportKeys), pq.Array(homeTeams),
 		pq.Array(awayTeams), pq.Array(commenceTimes), pq.Array(statuses),
 	)
 
@@ -445,7 +484,7 @@ func (w *Writer) upsertBooksFromOdds(ctx context.Context, tx *sql.Tx, odds []mod
 		sportKeys = append(sportKeys, sportKey)
 	}
 
-	_, err := tx.ExecContext(ctx, query, 
+	_, err := tx.ExecContext(ctx, query,
 		pq.Array(bookKeys), pq.Array(displayNames), pq.Array(sportKeys),
 	)
 
@@ -474,7 +513,7 @@ func filterEUBooks(odds []models.RawOdds) []models.RawOdds {
 	filtered := make([]models.RawOdds, 0, len(odds))
 	for _, odd := range odds {
 		bookKey := strings.ToLower(odd.BookKey)
-		
+
 		// Check if this is a known EU-only book
 		// If it's an allowed EU book OR any other book (US/US2), accept it
 		// This filters out unknown EU books while keeping Pinnacle
@@ -489,7 +528,7 @@ func filterEUBooks(odds []models.RawOdds) []models.RawOdds {
 			filtered = append(filtered, odd)
 		}
 	}
-	
+
 	return filtered
 }
 
@@ -517,7 +556,6 @@ func isEUOnlyBook(bookKey string) bool {
 		"suprabets":       true,
 		"onexbet":         true,
 	}
-	
+
 	return euOnlyBooks[bookKey]
 }
-

@@ -130,13 +130,9 @@ func (w *Writer) WriteWithEvents(ctx context.Context, events []models.Event, odd
 
 	// Step 0: Upsert events
 	if len(events) > 0 {
-		fmt.Printf("[Writer] Upserting %d events to update last_seen_at\n", len(events))
 		if err := w.upsertEventsFromList(ctx, tx, events); err != nil {
 			return fmt.Errorf("upsert events: %w", err)
 		}
-		fmt.Printf("[Writer] Successfully upserted %d events\n", len(events))
-	} else {
-		fmt.Printf("[Writer] WARNING: No events to upsert (len=0)\n")
 	}
 
 	// Step 0.5: Upsert books (extract from odds)
@@ -210,6 +206,7 @@ func (w *Writer) Flush(ctx context.Context) error {
 	}
 
 	// Step 3: Publish to Redis Streams (after successful DB write)
+	// Note: events are not available in Flush context, pass nil
 	if err := w.publishToStream(ctx, odds, nil); err != nil {
 		// Log but don't fail - DB is source of truth
 		fmt.Printf("publish to stream error: %v\n", err)
@@ -309,42 +306,10 @@ func (w *Writer) publishToStream(ctx context.Context, odds []models.RawOdds, eve
 		return nil
 	}
 
-	// Always look up event status from database (authoritative source from StatusUpdater)
-	// The events parameter may have stale status from API parsing
+	// Build event status lookup map
 	eventStatusMap := make(map[string]string)
-	eventIDs := make([]string, 0, len(odds))
-	seenIDs := make(map[string]bool)
-	for _, odd := range odds {
-		if !seenIDs[odd.EventID] {
-			eventIDs = append(eventIDs, odd.EventID)
-			seenIDs[odd.EventID] = true
-		}
-	}
-
-	if len(eventIDs) > 0 {
-		query := `SELECT event_id, event_status FROM events WHERE event_id = ANY($1)`
-		rows, err := w.db.QueryContext(ctx, query, pq.Array(eventIDs))
-		if err != nil {
-			fmt.Printf("[Writer] ERROR looking up event status: %v\n", err)
-		} else {
-			defer rows.Close()
-			liveCount := 0
-			upcomingCount := 0
-			for rows.Next() {
-				var eventID, status string
-				if err := rows.Scan(&eventID, &status); err == nil {
-					eventStatusMap[eventID] = status
-					if status == "live" {
-						liveCount++
-					} else {
-						upcomingCount++
-					}
-				}
-			}
-			if liveCount > 0 || upcomingCount > 0 {
-				fmt.Printf("[Writer] Event status lookup: %d live, %d upcoming\n", liveCount, upcomingCount)
-			}
-		}
+	for _, event := range events {
+		eventStatusMap[event.EventID] = event.EventStatus
 	}
 
 	// Group by sport for separate streams
@@ -386,8 +351,6 @@ func (w *Writer) publishToStream(ctx context.Context, odds []models.RawOdds, eve
 
 			pipe.XAdd(ctx, &redis.XAddArgs{
 				Stream: streamKey,
-				MaxLen: 10000, // Auto-trim to prevent memory pressure and consumer group desync
-				Approx: true,  // Use ~ for efficiency (MAXLEN ~ 10000)
 				Values: map[string]interface{}{
 					"data": msgJSON,
 				},
@@ -421,8 +384,7 @@ func (w *Writer) upsertEventsFromList(ctx context.Context, tx *sql.Tx, events []
 			home_team = EXCLUDED.home_team,
 			away_team = EXCLUDED.away_team,
 			commence_time = EXCLUDED.commence_time,
-			event_status = EXCLUDED.event_status,
-			last_seen_at = NOW()
+			event_status = EXCLUDED.event_status
 	`
 
 	eventIDs := make([]string, len(events))

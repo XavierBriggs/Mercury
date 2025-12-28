@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/XavierBriggs/Mercury/internal/closer"
 	"github.com/XavierBriggs/Mercury/internal/registry"
 	"github.com/XavierBriggs/Mercury/internal/scheduler"
+	"github.com/XavierBriggs/Mercury/internal/talos"
 	"github.com/XavierBriggs/Mercury/sports/basketball_nba"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
@@ -75,6 +77,33 @@ func main() {
 	// Initialize scheduler
 	sched := scheduler.NewScheduler(db, redisClient, adapter, config.CacheTTL, sportRegistry)
 
+	// Initialize Talos client for page warming (if enabled)
+	var talosClient *talos.Client
+	if config.TalosEnabled {
+		talosClient = talos.NewClient(talos.Config{
+			BaseURL: config.TalosURL,
+			Enabled: true,
+			Books:   config.TalosBooks,
+			Timeout: 30 * time.Second,
+		})
+		fmt.Printf("✓ Talos page warming enabled (URL: %s, Books: %v)\n", config.TalosURL, config.TalosBooks)
+
+		// Inject Talos client into writer
+		sched.Writer.SetTalosClient(talosClient)
+
+		// Load existing events to prevent re-warming
+		if err := sched.Writer.LoadSeenEventsFromDB(ctx); err != nil {
+			fmt.Printf("⚠ Failed to load seen events: %v\n", err)
+		}
+
+		// Warm any upcoming events that may have been missed
+		if err := sched.Writer.WarmUpcomingEvents(ctx); err != nil {
+			fmt.Printf("⚠ Failed to warm upcoming events: %v\n", err)
+		}
+	} else {
+		fmt.Println("⚠ Talos page warming disabled (set TALOS_ENABLED=true to enable)")
+	}
+
 	// Start scheduler
 	if err := sched.Start(ctx); err != nil {
 		fmt.Printf("failed to start scheduler: %v\n", err)
@@ -83,6 +112,9 @@ func main() {
 
 	// Initialize and start event status updater
 	statusUpdater := closer.NewStatusUpdater(db, config.StatusUpdateInterval)
+	if talosClient != nil {
+		statusUpdater.SetTalosClient(talosClient)
+	}
 	go statusUpdater.Start(ctx)
 
 	// Initialize and start closing line capturer
@@ -139,6 +171,11 @@ type Config struct {
 	CacheTTL                time.Duration
 	StatusUpdateInterval    time.Duration
 	ClosingLinePollInterval time.Duration
+
+	// Talos page warming config
+	TalosURL     string
+	TalosEnabled bool
+	TalosBooks   []string
 }
 
 // loadConfig loads configuration from environment variables
@@ -173,6 +210,16 @@ func loadConfig() Config {
 		}
 	}
 
+	// Parse Talos config
+	talosEnabled := os.Getenv("TALOS_ENABLED") == "true"
+	talosBooks := []string{}
+	if booksStr := os.Getenv("TALOS_BOOKS"); booksStr != "" {
+		talosBooks = strings.Split(booksStr, ",")
+	} else {
+		// Default books if enabled but not specified
+		talosBooks = []string{"betmgm", "fanduel", "hardrockbet", "bovada"}
+	}
+
 	config := Config{
 		AlexandriaDSN:           getEnv("ALEXANDRIA_DSN", "postgres://fortuna:fortuna@localhost:5432/alexandria?sslmode=disable"),
 		RedisURL:                getEnv("REDIS_URL", "localhost:6379"),
@@ -181,6 +228,9 @@ func loadConfig() Config {
 		CacheTTL:                cacheTTL,
 		StatusUpdateInterval:    statusUpdateInterval,
 		ClosingLinePollInterval: closingLinePollInterval,
+		TalosURL:                getEnv("TALOS_URL", "http://localhost:5008"),
+		TalosEnabled:            talosEnabled,
+		TalosBooks:              talosBooks,
 	}
 
 	if config.OddsAPIKey == "" {

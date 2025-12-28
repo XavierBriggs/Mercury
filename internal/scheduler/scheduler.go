@@ -18,12 +18,12 @@ import (
 
 // Scheduler orchestrates polling for all registered sports
 type Scheduler struct {
-	adapter      contracts.VendorAdapter
-	deltaEngine  *delta.Engine
-	writer       *writer.Writer
+	adapter       contracts.VendorAdapter
+	deltaEngine   *delta.Engine
+	Writer        *writer.Writer // Exported to allow Talos client injection
 	sportRegistry *registry.SportRegistry
-	stopChan     chan struct{}
-	wg           sync.WaitGroup
+	stopChan      chan struct{}
+	wg            sync.WaitGroup
 }
 
 // NewScheduler creates a new polling scheduler
@@ -37,7 +37,7 @@ func NewScheduler(
 	return &Scheduler{
 		adapter:       adapter,
 		deltaEngine:   delta.NewEngine(redisClient, cacheTTL),
-		writer:        writer.NewWriter(db, redisClient),
+		Writer:        writer.NewWriter(db, redisClient),
 		sportRegistry: sportRegistry,
 		stopChan:      make(chan struct{}),
 	}
@@ -46,7 +46,7 @@ func NewScheduler(
 // Start begins polling for all registered sports
 func (s *Scheduler) Start(ctx context.Context) error {
 	// Start writer's background flush
-	s.writer.Start(ctx)
+	s.Writer.Start(ctx)
 
 	// Start polling for each registered sport
 	sports := s.sportRegistry.GetAll()
@@ -81,7 +81,7 @@ func (s *Scheduler) Start(ctx context.Context) error {
 func (s *Scheduler) Stop() {
 	close(s.stopChan)
 	s.wg.Wait()
-	s.writer.Stop()
+	s.Writer.Stop()
 }
 
 // pollSportFeatured polls featured markets for a specific sport
@@ -208,7 +208,7 @@ func (s *Scheduler) fetchAndProcess(ctx context.Context, opts *models.FetchOddsO
 		deltaOdds[i] = d.Odd
 	}
 
-	if err := s.writer.WriteWithEvents(ctx, result.Events, deltaOdds); err != nil {
+	if err := s.Writer.WriteWithEvents(ctx, result.Events, deltaOdds); err != nil {
 		return fmt.Errorf("write deltas: %w", err)
 	}
 

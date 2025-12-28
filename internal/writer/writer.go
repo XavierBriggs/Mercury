@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/XavierBriggs/Mercury/internal/talos"
 	"github.com/XavierBriggs/Mercury/pkg/models"
 	"github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
@@ -25,6 +26,7 @@ const (
 type Writer struct {
 	db    *sql.DB
 	redis *redis.Client
+	talos *talos.Client // Optional Talos client for page warming
 
 	batchSize     int
 	flushInterval time.Duration
@@ -35,6 +37,10 @@ type Writer struct {
 	flushTicker *time.Ticker
 	stopChan    chan struct{}
 	wg          sync.WaitGroup
+
+	// Track seen events to only warm new ones
+	seenEvents   map[string]bool
+	seenEventsMu sync.RWMutex
 }
 
 // StreamMessage represents a message published to Redis Stream
@@ -61,7 +67,13 @@ func NewWriter(db *sql.DB, redisClient *redis.Client) *Writer {
 		flushInterval: defaultFlushInterval,
 		buffer:        make([]models.RawOdds, 0, defaultBatchSize),
 		stopChan:      make(chan struct{}),
+		seenEvents:    make(map[string]bool),
 	}
+}
+
+// SetTalosClient sets the Talos client for page warming
+func (w *Writer) SetTalosClient(client *talos.Client) {
+	w.talos = client
 }
 
 // Start begins the background flush ticker
@@ -121,6 +133,9 @@ func (w *Writer) WriteWithEvents(ctx context.Context, events []models.Event, odd
 	// All US/US2 books are accepted automatically
 	odds = filterEUBooks(odds)
 
+	// Identify new events (not seen before) for page warming
+	newEvents := w.identifyNewEvents(events)
+
 	// Execute write in transaction immediately (bypass buffer)
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -165,6 +180,11 @@ func (w *Writer) WriteWithEvents(ctx context.Context, events []models.Event, odd
 			// Log but don't fail - DB is source of truth
 			fmt.Printf("publish to stream error: %v\n", err)
 		}
+	}
+
+	// Step 4: Warm game pages for new events (after successful DB write)
+	if len(newEvents) > 0 {
+		w.warmGamePages(ctx, newEvents)
 	}
 
 	return nil
@@ -520,4 +540,208 @@ func isEUOnlyBook(bookKey string) bool {
 	}
 
 	return euOnlyBooks[bookKey]
+}
+
+// identifyNewEvents returns events that haven't been seen before
+// This is used to trigger page warming only for genuinely new events
+func (w *Writer) identifyNewEvents(events []models.Event) []models.Event {
+	if len(events) == 0 {
+		return nil
+	}
+
+	w.seenEventsMu.Lock()
+	defer w.seenEventsMu.Unlock()
+
+	newEvents := make([]models.Event, 0)
+	for _, evt := range events {
+		if !w.seenEvents[evt.EventID] {
+			w.seenEvents[evt.EventID] = true
+			newEvents = append(newEvents, evt)
+		}
+	}
+
+	return newEvents
+}
+
+// warmGamePages sends OpenGamePage requests to Talos for new events
+// Only warms events within 72 hours (most sportsbooks only list 1-3 days ahead)
+// Rate limited to 1 second between requests to avoid overwhelming Talos
+func (w *Writer) warmGamePages(ctx context.Context, events []models.Event) {
+	if w.talos == nil || !w.talos.IsEnabled() {
+		return
+	}
+
+	// Filter events that should be warmed
+	now := time.Now()
+	warmWindow := 72 * time.Hour // Match sportsbook availability window
+
+	var toWarm []models.Event
+	var skippedFuture int
+
+	for _, evt := range events {
+		// Only warm pages for upcoming events (not live or completed)
+		if evt.EventStatus != "" && evt.EventStatus != "upcoming" {
+			continue
+		}
+
+		// Skip if commence time is in the past
+		if evt.CommenceTime.Before(now) {
+			continue
+		}
+
+		// Skip if event is too far in the future (sportsbook won't have it listed)
+		if evt.CommenceTime.After(now.Add(warmWindow)) {
+			skippedFuture++
+			continue
+		}
+
+		toWarm = append(toWarm, evt)
+	}
+
+	if len(toWarm) == 0 {
+		if skippedFuture > 0 {
+			fmt.Printf("[Writer] Skipped %d events beyond 72h window\n", skippedFuture)
+		}
+		return
+	}
+
+	if skippedFuture > 0 {
+		fmt.Printf("[Writer] Warming %d events (skipped %d beyond 72h window)\n", len(toWarm), skippedFuture)
+	} else {
+		fmt.Printf("[Writer] Warming %d new events...\n", len(toWarm))
+	}
+
+	// Send page warm requests with rate limiting
+	// Use a goroutine to avoid blocking the writer, but rate limit internally
+	go func() {
+		for i, e := range toWarm {
+			warmCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+
+			if err := w.talos.OpenGamePage(warmCtx, e.HomeTeam, e.AwayTeam, e.SportKey, e.CommenceTime); err != nil {
+				fmt.Printf("[Writer] Page warm failed for %s @ %s: %v\n", e.AwayTeam, e.HomeTeam, err)
+			}
+
+			cancel()
+
+			// Rate limit: 1 second between requests, except after last
+			if i < len(toWarm)-1 {
+				time.Sleep(1 * time.Second)
+			}
+		}
+	}()
+}
+
+// ClearSeenEvents clears the seen events cache (useful for testing or restarts)
+func (w *Writer) ClearSeenEvents() {
+	w.seenEventsMu.Lock()
+	defer w.seenEventsMu.Unlock()
+	w.seenEvents = make(map[string]bool)
+}
+
+// LoadSeenEventsFromDB loads existing event IDs from the database
+// Call this on startup to prevent re-warming events that are already in DB
+func (w *Writer) LoadSeenEventsFromDB(ctx context.Context) error {
+	query := `
+		SELECT event_id FROM events
+		WHERE event_status IN ('upcoming', 'live')
+	`
+
+	rows, err := w.db.QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("query seen events: %w", err)
+	}
+	defer rows.Close()
+
+	w.seenEventsMu.Lock()
+	defer w.seenEventsMu.Unlock()
+
+	count := 0
+	for rows.Next() {
+		var eventID string
+		if err := rows.Scan(&eventID); err != nil {
+			continue
+		}
+		w.seenEvents[eventID] = true
+		count++
+	}
+
+	fmt.Printf("[Writer] Loaded %d existing events into seenEvents cache\n", count)
+	return nil
+}
+
+// WarmUpcomingEvents sends OpenGamePage requests for ALL upcoming events on startup
+// This ensures game pages are warmed even if Talos was down when Mercury discovered the events.
+//
+// Key behavior:
+// - Warms ALL events within 72 hours (sportsbook availability window)
+// - Does NOT check seenEvents - that's only for preventing duplicates during polling
+// - Marks events as seen AFTER queuing warm request (prevents re-warming during polling)
+// - Talos has deduplication at the bot level, so duplicate requests are safe
+func (w *Writer) WarmUpcomingEvents(ctx context.Context) error {
+	if w.talos == nil || !w.talos.IsEnabled() {
+		fmt.Println("[Writer] Talos client not enabled, skipping warm-up")
+		return nil
+	}
+
+	// Only warm events in the near future that sportsbooks will have listed
+	// Most sportsbooks show games 1-3 days ahead, use 72 hours as safe window
+	query := `
+		SELECT event_id, sport_key, home_team, away_team, commence_time
+		FROM events
+		WHERE event_status = 'upcoming'
+		  AND commence_time > NOW()
+		  AND commence_time < NOW() + INTERVAL '72 hours'
+		ORDER BY commence_time ASC
+	`
+
+	rows, err := w.db.QueryContext(ctx, query)
+	if err != nil {
+		return fmt.Errorf("query upcoming events: %w", err)
+	}
+	defer rows.Close()
+
+	// Collect ALL events within 72h window - don't check seenEvents
+	// seenEvents is for polling deduplication, not startup
+	var eventsToWarm []models.Event
+
+	for rows.Next() {
+		var evt models.Event
+		if err := rows.Scan(&evt.EventID, &evt.SportKey, &evt.HomeTeam, &evt.AwayTeam, &evt.CommenceTime); err != nil {
+			fmt.Printf("[Writer] Scan warning: %v\n", err)
+			continue
+		}
+		evt.EventStatus = "upcoming"
+		eventsToWarm = append(eventsToWarm, evt)
+	}
+
+	if len(eventsToWarm) == 0 {
+		fmt.Println("[Writer] No upcoming events within 72h window to warm")
+		return nil
+	}
+
+	fmt.Printf("[Writer] Startup warm-up: sending %d events to Talos (Talos will deduplicate)...\n", len(eventsToWarm))
+
+	// Warm pages for all events
+	for _, evt := range eventsToWarm {
+		// Mark as seen so polling doesn't re-warm these
+		w.seenEventsMu.Lock()
+		w.seenEvents[evt.EventID] = true
+		w.seenEventsMu.Unlock()
+
+		// Send warm request (async)
+		go func(e models.Event) {
+			warmCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			if err := w.talos.OpenGamePage(warmCtx, e.HomeTeam, e.AwayTeam, e.SportKey, e.CommenceTime); err != nil {
+				fmt.Printf("[Writer] Warm-up failed for %s @ %s: %v\n", e.AwayTeam, e.HomeTeam, err)
+			}
+		}(evt)
+
+		// Rate limit: 1 second between requests to avoid overwhelming Talos
+		time.Sleep(1 * time.Second)
+	}
+
+	fmt.Printf("[Writer] Warm-up requests sent for %d events\n", len(eventsToWarm))
+	return nil
 }
